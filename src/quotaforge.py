@@ -38,6 +38,10 @@ class QuotaForgeError(RuntimeError):
     pass
 
 
+class CycleAlreadyRunning(QuotaForgeError):
+    pass
+
+
 @dataclass(frozen=True)
 class RepoSpec:
     url: str
@@ -629,7 +633,7 @@ def acquire_lock(path: pathlib.Path):
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             handle.close()
-            raise QuotaForgeError("Another QuotaForge cycle is already running.") from exc
+            raise CycleAlreadyRunning("Another QuotaForge cycle is already running.") from exc
     return handle
 
 
@@ -668,7 +672,11 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
     config = load_config(config_path)
     data_dir = config_path.parent
     logger = JsonLogger(data_dir / "logs" / "quotaforge.jsonl")
-    lock = acquire_lock(data_dir / "quotaforge.lock")
+    try:
+        lock = acquire_lock(data_dir / "quotaforge.lock")
+    except CycleAlreadyRunning as exc:
+        logger.write("skipped", reason=str(exc))
+        return 0
     try:
         repos = enabled_repos(config)
         if not repos:

@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 import time
 import unittest
 
@@ -90,6 +91,19 @@ class SensitivePathTests(unittest.TestCase):
 
     def test_allows_normal_source_paths(self):
         self.assertIsNone(quotaforge.SENSITIVE_NAMES.search("src/config.py"))
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows file locking test")
+class LockTests(unittest.TestCase):
+    def test_second_cycle_lock_is_reported_as_expected_contention(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = pathlib.Path(temporary) / "quotaforge.lock"
+            first = quotaforge.acquire_lock(lock_path)
+            try:
+                with self.assertRaises(quotaforge.CycleAlreadyRunning):
+                    quotaforge.acquire_lock(lock_path)
+            finally:
+                first.close()
 
 
 if __name__ == "__main__":
