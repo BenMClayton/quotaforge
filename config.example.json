@@ -1,0 +1,27 @@
+{
+  "whitelist": [
+    {
+      "url": "https://github.com/YOUR_ACCOUNT/YOUR_REPOSITORY.git",
+      "enabled": false,
+      "branch": null
+    }
+  ],
+  "trigger": {
+    "minutesBeforeReset": 30,
+    "minimumIdleMinutes": 20,
+    "targetUsedPercent": 99,
+    "minimumRemainingPercent": 1,
+    "safetyBufferMinutes": 3,
+    "maxCycleMinutes": 25,
+    "maxTurnsPerCycle": 6
+  },
+  "behavior": {
+    "push": true,
+    "model": null,
+    "reasoningEffort": "medium"
+  },
+  "notifications": {
+    "windowsBalloon": true,
+    "webhookUrl": null
+  }
+}
