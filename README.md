@@ -28,7 +28,7 @@ cd quotaforge
 .\install.ps1
 ```
 
-The installer creates `%LOCALAPPDATA%\QuotaForge\config.json` and a hidden
+The installer creates `%USERPROFILE%\.quotaforge\config.json` and a hidden
 per-user Scheduled Task that checks every five minutes. When the current clone
 has a GitHub `origin`, it is added as the first disabled allowlist example; edit
 the config and set `enabled` to `true` after reviewing it.

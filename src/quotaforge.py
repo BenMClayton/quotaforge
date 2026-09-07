@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.parse
 import urllib.request
 import uuid
@@ -24,7 +25,7 @@ from typing import Any
 
 APP_NAME = "QuotaForge"
 VERSION = "0.1.0"
-DEFAULT_DATA = pathlib.Path(os.environ.get("LOCALAPPDATA", pathlib.Path.home())) / APP_NAME
+DEFAULT_DATA = pathlib.Path.home() / ".quotaforge"
 DEFAULT_CONFIG = DEFAULT_DATA / "config.json"
 GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SENSITIVE_NAMES = re.compile(
@@ -111,7 +112,40 @@ def command_path(name: str) -> str:
         found = shutil.which(candidate)
         if found:
             return found
+    if os.name == "nt" and name == "codex":
+        local_app_data = pathlib.Path(os.environ.get("LOCALAPPDATA", ""))
+        native_root = local_app_data / "OpenAI" / "Codex" / "bin"
+        native_candidates = sorted(
+            native_root.glob("*/codex.exe"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if native_candidates:
+            return str(native_candidates[0])
+        app_data = pathlib.Path(os.environ.get("APPDATA", ""))
+        npm_launcher = app_data / "npm" / "codex.cmd"
+        if npm_launcher.is_file():
+            return str(npm_launcher)
     raise QuotaForgeError(f"Required command not found: {name}")
+
+
+def write_fatal_log(config_path: pathlib.Path, exc: BaseException) -> None:
+    """Best-effort diagnostics for background launches that have no console."""
+    try:
+        log_path = config_path.parent / "logs" / "fatal.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "time": utc_now(),
+            "event": "fatal",
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "python": sys.executable,
+            "traceback": traceback.format_exc(limit=8),
+        }
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def run(
@@ -661,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             return cycle(args.config, args.force, args.dry_run)
         raise QuotaForgeError("Choose --status or --once.")
     except (QuotaForgeError, subprocess.TimeoutExpired) as exc:
+        write_fatal_log(args.config, exc)
         print(f"QuotaForge: {exc}", file=sys.stderr)
         return 1
 

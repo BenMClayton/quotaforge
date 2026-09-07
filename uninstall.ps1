@@ -10,10 +10,10 @@ if ($task) {
 }
 
 if ($RemoveData) {
-    $dataPath = Join-Path $env:LOCALAPPDATA 'QuotaForge'
+    $dataPath = Join-Path $env:USERPROFILE '.quotaforge'
     if (Test-Path -LiteralPath $dataPath) {
         $resolved = (Resolve-Path -LiteralPath $dataPath).Path
-        $expected = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'QuotaForge'))
+        $expected = [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.quotaforge'))
         if ($resolved -ne $expected) {
             throw "Refusing to remove unexpected path: $resolved"
         }

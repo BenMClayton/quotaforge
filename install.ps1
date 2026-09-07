@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'QuotaForge\config.json'),
+    [string]$ConfigPath = (Join-Path $env:USERPROFILE '.quotaforge\config.json'),
     [switch]$EnableOrigin
 )
 
