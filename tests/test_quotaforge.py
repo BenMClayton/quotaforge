@@ -32,22 +32,54 @@ class UrlTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
-    def test_selects_nearest_eligible_reset(self):
-        now = time.time()
-        windows = [
-            quotaforge.Window("weekly", 40, int(now + 20 * 60), 10080),
-            quotaforge.Window("short", 50, int(now + 10 * 60), 300),
-        ]
-        selected = quotaforge.select_expiring_window(windows, 30, 99, 1)
-        self.assertEqual(selected.name, "short")
+    def plan(self, windows, now):
+        return quotaforge.build_pacing_plan(
+            windows,
+            minutes_before_short_reset=30,
+            target_used=99,
+            minimum_remaining=1,
+            pacing_headroom=5,
+            final_drain_minutes=180,
+            minimum_weekly_duration=8640,
+            now=now,
+        )
 
-    def test_ignores_target_and_distant_windows(self):
-        now = time.time()
+    def test_allows_catchup_near_short_reset_below_weekly_pace(self):
+        now = 2_000_000_000
         windows = [
-            quotaforge.Window("done", 99, int(now + 10 * 60), 300),
-            quotaforge.Window("later", 2, int(now + 60 * 60), 300),
+            quotaforge.Window("codex:secondary", 5, int(now + 6 * 86400), 10080),
+            quotaforge.Window("codex:primary", 50, int(now + 10 * 60), 300),
         ]
-        self.assertIsNone(quotaforge.select_expiring_window(windows, 30, 99, 1))
+        plan = self.plan(windows, now)
+        self.assertTrue(plan.eligible)
+        self.assertAlmostEqual(plan.weekly_progress_percent, 100 / 7, places=1)
+        self.assertAlmostEqual(plan.weekly_cap_percent, 99 / 7 - 5, places=1)
+
+    def test_blocks_automation_when_weekly_usage_is_ahead_of_pace(self):
+        now = 2_000_000_000
+        windows = [
+            quotaforge.Window("codex:secondary", 12, int(now + 6 * 86400), 10080),
+            quotaforge.Window("codex:primary", 2, int(now + 10 * 60), 300),
+        ]
+        plan = self.plan(windows, now)
+        self.assertFalse(plan.budget_available)
+        self.assertFalse(plan.eligible)
+
+    def test_final_weekly_drain_does_not_require_short_reset(self):
+        now = 2_000_000_000
+        windows = [
+            quotaforge.Window("codex:secondary", 90, int(now + 60 * 60), 10080),
+            quotaforge.Window("codex:primary", 2, int(now + 240 * 60), 300),
+        ]
+        plan = self.plan(windows, now)
+        self.assertTrue(plan.final_drain)
+        self.assertTrue(plan.eligible)
+        self.assertEqual(plan.weekly_cap_percent, 99)
+
+    def test_fails_closed_without_weekly_window(self):
+        now = time.time()
+        with self.assertRaises(quotaforge.QuotaForgeError):
+            self.plan([quotaforge.Window("codex:primary", 2, int(now + 600), 300)], now)
 
 
 class SensitivePathTests(unittest.TestCase):

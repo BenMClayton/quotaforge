@@ -58,7 +58,19 @@ class Window:
     duration_minutes: int
 
     def minutes_remaining(self, now: float | None = None) -> float:
-        return (self.resets_at - (now or time.time())) / 60
+        return (self.resets_at - (time.time() if now is None else now)) / 60
+
+
+@dataclass(frozen=True)
+class PacingPlan:
+    weekly: Window
+    short: Window | None
+    weekly_progress_percent: float
+    weekly_cap_percent: float
+    final_drain: bool
+    budget_available: bool
+    eligible: bool
+    reason: str
 
 
 def utc_now() -> str:
@@ -278,17 +290,71 @@ def idle_minutes() -> float:
     return elapsed_ms / 60000
 
 
-def select_expiring_window(
-    windows: list[Window], minutes_before: float, target_used: float, minimum_remaining: float
-) -> Window | None:
-    candidates = [
+def build_pacing_plan(
+    windows: list[Window],
+    *,
+    minutes_before_short_reset: float,
+    target_used: float,
+    minimum_remaining: float,
+    pacing_headroom: float,
+    final_drain_minutes: float,
+    minimum_weekly_duration: int,
+    now: float | None = None,
+) -> PacingPlan:
+    """Limit autonomous use to a gradually increasing weekly budget."""
+    current_time = time.time() if now is None else now
+    weekly_candidates = [
+        window for window in windows if window.duration_minutes >= minimum_weekly_duration
+    ]
+    if not weekly_candidates:
+        raise QuotaForgeError("No weekly Codex quota window was found; failing closed.")
+    weekly = max(weekly_candidates, key=lambda item: item.duration_minutes)
+    weekly_remaining = weekly.minutes_remaining(current_time)
+    if weekly_remaining <= 0:
+        raise QuotaForgeError("The weekly quota window is stale; waiting for refreshed usage data.")
+
+    elapsed_minutes = max(0.0, weekly.duration_minutes - weekly_remaining)
+    progress = min(1.0, elapsed_minutes / weekly.duration_minutes)
+    progress_percent = progress * 100
+    final_drain = weekly_remaining <= final_drain_minutes
+    if final_drain:
+        cap = target_used
+    else:
+        cap = max(0.0, min(target_used, target_used * progress - pacing_headroom))
+
+    limit_id = weekly.name.split(":", 1)[0]
+    short_candidates = [
         window
         for window in windows
-        if 0 < window.minutes_remaining() <= minutes_before
-        and window.used_percent < target_used
-        and (100 - window.used_percent) >= minimum_remaining
+        if window.name.split(":", 1)[0] == limit_id
+        and window.duration_minutes < weekly.duration_minutes
+        and 0 < window.minutes_remaining(current_time) <= minutes_before_short_reset
     ]
-    return min(candidates, key=lambda item: item.resets_at) if candidates else None
+    short = min(short_candidates, key=lambda item: item.resets_at) if short_candidates else None
+    budget_available = (
+        weekly.used_percent < cap and (100 - weekly.used_percent) >= minimum_remaining
+    )
+    if not budget_available:
+        reason = (
+            f"Weekly usage {weekly.used_percent:.1f}% is at or ahead of the "
+            f"current {cap:.1f}% pacing cap."
+        )
+    elif not final_drain and short is None:
+        reason = "Weekly budget is available, but no short window is close to reset."
+    elif final_drain:
+        reason = "Final weekly drain window is active and paced budget remains."
+    else:
+        reason = "Short window is close to reset and paced weekly budget remains."
+    return PacingPlan(
+        weekly=weekly,
+        short=short,
+        weekly_progress_percent=progress_percent,
+        weekly_cap_percent=cap,
+        final_drain=final_drain,
+        budget_available=budget_available,
+        eligible=budget_available and (final_drain or short is not None),
+        reason=reason,
+    )
 
 
 class JsonLogger:
@@ -580,6 +646,21 @@ def status(config_path: pathlib.Path, config: dict[str, Any]) -> int:
             f"{window.name}: {window.used_percent:.0f}% used, "
             f"resets {reset.isoformat(timespec='seconds')} ({window.minutes_remaining():.1f} min)"
         )
+    trigger = config.get("trigger", {})
+    plan = build_pacing_plan(
+        windows,
+        minutes_before_short_reset=float(trigger.get("minutesBeforeReset", 30)),
+        target_used=float(trigger.get("targetUsedPercent", 99)),
+        minimum_remaining=float(trigger.get("minimumRemainingPercent", 1)),
+        pacing_headroom=float(trigger.get("pacingHeadroomPercent", 5)),
+        final_drain_minutes=float(trigger.get("finalWeeklyDrainMinutes", 180)),
+        minimum_weekly_duration=int(trigger.get("weeklyWindowMinimumMinutes", 8640)),
+    )
+    print(
+        f"Weekly pacing: {plan.weekly_progress_percent:.1f}% through week, "
+        f"autonomous cap {plan.weekly_cap_percent:.1f}%, eligible={plan.eligible}"
+    )
+    print(f"Pacing decision: {plan.reason}")
     return 0
 
 
@@ -601,22 +682,52 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
         minimum_idle = float(trigger.get("minimumIdleMinutes", 20))
         target_used = float(trigger.get("targetUsedPercent", 99))
         minimum_remaining = float(trigger.get("minimumRemainingPercent", 1))
+        pacing_headroom = float(trigger.get("pacingHeadroomPercent", 5))
+        final_drain_minutes = float(trigger.get("finalWeeklyDrainMinutes", 180))
+        minimum_weekly_duration = int(trigger.get("weeklyWindowMinimumMinutes", 8640))
         max_minutes = float(trigger.get("maxCycleMinutes", 25))
-        max_turns = int(trigger.get("maxTurnsPerCycle", 6))
+        max_turns = int(trigger.get("maxTurnsPerCycle", 1))
         safety_buffer = float(trigger.get("safetyBufferMinutes", 3))
 
         _, windows = read_windows()
-        selected = select_expiring_window(windows, minutes_before, target_used, minimum_remaining)
-        if not force and selected is None:
-            logger.write("skipped", reason="No eligible quota window is close to reset.")
+        plan = build_pacing_plan(
+            windows,
+            minutes_before_short_reset=minutes_before,
+            target_used=target_used,
+            minimum_remaining=minimum_remaining,
+            pacing_headroom=pacing_headroom,
+            final_drain_minutes=final_drain_minutes,
+            minimum_weekly_duration=minimum_weekly_duration,
+        )
+        if not plan.budget_available and not (force and dry_run):
+            logger.write(
+                "skipped",
+                reason=plan.reason,
+                weeklyUsedPercent=plan.weekly.used_percent,
+                weeklyCapPercent=plan.weekly_cap_percent,
+            )
+            return 0
+        if not force and not plan.eligible:
+            logger.write("skipped", reason=plan.reason)
             return 0
         if not force and idle_minutes() < minimum_idle:
             logger.write("skipped", reason="Computer is not idle enough.", idleMinutes=idle_minutes())
             return 0
 
-        anchor_reset = selected.resets_at if selected else int(time.time() + max_minutes * 60)
+        anchor_reset = (
+            plan.weekly.resets_at
+            if plan.final_drain
+            else plan.short.resets_at
+            if plan.short
+            else int(time.time() + max_minutes * 60)
+        )
         available_seconds = max(0, anchor_reset - time.time() - safety_buffer * 60)
-        hard_deadline = time.monotonic() + min(max_minutes * 60, available_seconds or max_minutes * 60)
+        if available_seconds <= 0 and not dry_run:
+            logger.write("skipped", reason="Too close to reset to finish safely.")
+            return 0
+        hard_deadline = time.monotonic() + min(
+            max_minutes * 60, available_seconds if available_seconds > 0 else max_minutes * 60
+        )
         state_path = data_dir / "state.json"
         state = load_state(state_path)
         start_index = int(state.get("nextRepoIndex", 0)) % len(repos)
@@ -628,12 +739,29 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
             if not force and idle_minutes() < minimum_idle:
                 logger.write("stopped", reason="User activity detected between turns.")
                 break
-            if not force:
-                _, current_windows = read_windows()
-                current = next((item for item in current_windows if item.name == selected.name), None)
-                if current is None or current.resets_at != anchor_reset or current.used_percent >= target_used:
-                    logger.write("target_reached", window=selected.name)
-                    break
+            _, current_windows = read_windows()
+            current_plan = build_pacing_plan(
+                current_windows,
+                minutes_before_short_reset=minutes_before,
+                target_used=target_used,
+                minimum_remaining=minimum_remaining,
+                pacing_headroom=pacing_headroom,
+                final_drain_minutes=final_drain_minutes,
+                minimum_weekly_duration=minimum_weekly_duration,
+            )
+            if (
+                current_plan.weekly.resets_at != plan.weekly.resets_at
+                or not current_plan.budget_available
+            ):
+                logger.write(
+                    "pacing_cap_reached",
+                    weeklyUsedPercent=current_plan.weekly.used_percent,
+                    weeklyCapPercent=current_plan.weekly_cap_percent,
+                )
+                break
+            if not force and not current_plan.eligible:
+                logger.write("stopped", reason=current_plan.reason)
+                break
             spec = repos[(start_index + turn) % len(repos)]
             try:
                 effective_minimum_idle = 0 if force else minimum_idle

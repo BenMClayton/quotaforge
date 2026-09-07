@@ -11,9 +11,12 @@
     "minimumIdleMinutes": 20,
     "targetUsedPercent": 99,
     "minimumRemainingPercent": 1,
+    "pacingHeadroomPercent": 5,
+    "finalWeeklyDrainMinutes": 180,
+    "weeklyWindowMinimumMinutes": 8640,
     "safetyBufferMinutes": 3,
     "maxCycleMinutes": 25,
-    "maxTurnsPerCycle": 6
+    "maxTurnsPerCycle": 1
   },
   "behavior": {
     "push": true,

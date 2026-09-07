@@ -5,8 +5,9 @@ improvements for GitHub repositories you explicitly allow.
 
 It is deliberately conservative. A cycle starts only when:
 
-- a Codex quota window resets within the configured threshold (30 minutes by
-  default);
+- the 5-hour Codex window resets within the configured threshold (30 minutes
+  by default), or the weekly window is in its final drain period;
+- weekly usage is below a gradually increasing pacing cap;
 - Windows has been idle for the configured period (20 minutes by default);
 - Codex is authenticated with ChatGPT, not an API key;
 - the repository is on the exact GitHub allowlist; and
@@ -29,7 +30,8 @@ cd quotaforge
 ```
 
 The installer creates `%USERPROFILE%\.quotaforge\config.json` and a hidden
-per-user Scheduled Task that checks every five minutes. When the current clone
+per-user Scheduled Task that checks every five minutes and again after logon.
+The task persists across restarts, but runs only after the user signs in. When the current clone
 has a GitHub `origin`, it is added as the first disabled allowlist example; edit
 the config and set `enabled` to `true` after reviewing it.
 
@@ -55,6 +57,12 @@ committed accidentally. See [config.example.json](config.example.json).
 - `minutesBeforeReset`: start only shortly before a window resets.
 - `minimumIdleMinutes`: protect interactive use.
 - `targetUsedPercent`: stop once the expiring bucket reaches this value.
+- `pacingHeadroomPercent`: stay this far behind linear weekly consumption to
+  preserve room for interactive use (5% by default).
+- `finalWeeklyDrainMinutes`: during the final three hours, permit catch-up to
+  the final target even when no short window is near reset.
+- `weeklyWindowMinimumMinutes`: fail closed unless a genuine long-duration
+  weekly bucket is present.
 - `maxCycleMinutes` and `maxTurnsPerCycle`: hard runaway limits.
 - `push`: set false to keep commits local while evaluating the service.
 - `webhookUrl`: optional generic JSON webhook. Prefer the
@@ -77,8 +85,10 @@ Codex is instructed not to commit or push. QuotaForge owns those boundaries.
 ## Important limits
 
 Usage is reported as a percentage of a quota window, not as an exact count of
-remaining tokens. QuotaForge therefore works toward `targetUsedPercent` and
-stops at the reset boundary or hard time limit; it cannot guarantee an exact
+remaining tokens. QuotaForge paces autonomous usage against elapsed weekly
+time: roughly 9% after day one, 45% around midweek, and 80% after day six with
+the default 5% headroom. During the final three hours it may catch up to 99%.
+It stops at the reset boundary or hard time limit and cannot guarantee an exact
 zero remainder. Work complexity also changes how quickly usage is consumed.
 
 The Codex app-server surface used for local quota reads is documented, while
