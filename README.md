@@ -31,6 +31,8 @@ cd quotaforge
 
 The installer creates `%USERPROFILE%\.quotaforge\config.json` and a hidden
 per-user Scheduled Task that checks every five minutes and again after logon.
+Codex, Git, and notification helpers are also launched with Windows' no-console
+flag so those background checks do not flash terminal windows.
 The task persists across restarts, but runs only after the user signs in. When the current clone
 has a GitHub `origin`, it is added as the first disabled allowlist example; edit
 the config and set `enabled` to `true` after reviewing it.

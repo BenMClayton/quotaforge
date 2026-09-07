@@ -93,6 +93,16 @@ class SensitivePathTests(unittest.TestCase):
         self.assertIsNone(quotaforge.SENSITIVE_NAMES.search("src/config.py"))
 
 
+class BackgroundProcessTests(unittest.TestCase):
+    def test_child_processes_use_no_console_flag_on_windows(self):
+        expected = (
+            getattr(quotaforge.subprocess, "CREATE_NO_WINDOW", 0)
+            if quotaforge.os.name == "nt"
+            else 0
+        )
+        self.assertEqual(quotaforge.hidden_process_flags(), expected)
+
+
 @unittest.skipUnless(sys.platform == "win32", "Windows file locking test")
 class LockTests(unittest.TestCase):
     def test_second_cycle_lock_is_reported_as_expected_contention(self):

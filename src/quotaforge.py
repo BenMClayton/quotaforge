@@ -164,6 +164,13 @@ def write_fatal_log(config_path: pathlib.Path, exc: BaseException) -> None:
         pass
 
 
+def hidden_process_flags() -> int:
+    """Prevent every child process from allocating a visible Windows console."""
+    if os.name == "nt":
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return 0
+
+
 def run(
     args: list[str], cwd: pathlib.Path | None = None, check: bool = True, timeout: int = 120
 ) -> subprocess.CompletedProcess[str]:
@@ -176,6 +183,7 @@ def run(
         capture_output=True,
         timeout=timeout,
         shell=False,
+        creationflags=hidden_process_flags(),
     )
     if check and result.returncode:
         detail = (result.stderr or result.stdout).strip()[-2000:]
@@ -207,6 +215,7 @@ def app_server_request(method: str, params: dict[str, Any] | None = None) -> dic
         encoding="utf-8",
         errors="replace",
         shell=False,
+        creationflags=hidden_process_flags(),
     )
     assert proc.stdin and proc.stdout
     messages = [
@@ -390,7 +399,7 @@ def notify(config: dict[str, Any], title: str, message: str, logger: JsonLogger)
             ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=hidden_process_flags(),
         )
     webhook = os.environ.get("QUOTAFORGE_WEBHOOK_URL") or notifications.get("webhookUrl")
     if webhook:
@@ -513,7 +522,7 @@ def run_codex_improvement(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=hidden_process_flags(),
         )
         while proc.poll() is None:
             if time.monotonic() >= hard_deadline:

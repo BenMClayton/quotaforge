@@ -37,7 +37,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 
 $pythonCommand = Get-Command 'pythonw.exe' -ErrorAction SilentlyContinue
 if (-not $pythonCommand) {
-    $pythonCommand = Get-Command 'python.exe' -ErrorAction Stop
+    throw 'pythonw.exe is required so QuotaForge can run without opening a terminal window.'
 }
 $taskArguments = '"' + $runner + '" --config "' + $ConfigPath + '" --once'
 $action = New-ScheduledTaskAction -Execute $pythonCommand.Source -Argument $taskArguments `
