@@ -12,6 +12,7 @@
     "targetUsedPercent": 99,
     "minimumRemainingPercent": 1,
     "pacingHeadroomPercent": 5,
+    "bootstrapAllowancePercent": 3,
     "finalWeeklyDrainMinutes": 180,
     "weeklyWindowMinimumMinutes": 8640,
     "safetyBufferMinutes": 3,

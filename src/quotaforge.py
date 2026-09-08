@@ -310,6 +310,7 @@ def build_pacing_plan(
     target_used: float,
     minimum_remaining: float,
     pacing_headroom: float,
+    bootstrap_allowance: float,
     final_drain_minutes: float,
     minimum_weekly_duration: int,
     now: float | None = None,
@@ -333,7 +334,11 @@ def build_pacing_plan(
     if final_drain:
         cap = target_used
     else:
-        cap = max(0.0, min(target_used, target_used * progress - pacing_headroom))
+        # A completely unused rolling window may report a reset time that keeps
+        # moving forward until its first token is spent. Give the first expiring
+        # short window a small, fixed budget so weekly pacing can get anchored.
+        linear_cap = target_used * progress - pacing_headroom
+        cap = max(0.0, min(target_used, max(bootstrap_allowance, linear_cap)))
 
     limit_id = weekly.name.split(":", 1)[0]
     short_candidates = [
@@ -666,6 +671,7 @@ def status(config_path: pathlib.Path, config: dict[str, Any]) -> int:
         target_used=float(trigger.get("targetUsedPercent", 99)),
         minimum_remaining=float(trigger.get("minimumRemainingPercent", 1)),
         pacing_headroom=float(trigger.get("pacingHeadroomPercent", 5)),
+        bootstrap_allowance=float(trigger.get("bootstrapAllowancePercent", 3)),
         final_drain_minutes=float(trigger.get("finalWeeklyDrainMinutes", 180)),
         minimum_weekly_duration=int(trigger.get("weeklyWindowMinimumMinutes", 8640)),
     )
@@ -700,6 +706,7 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
         target_used = float(trigger.get("targetUsedPercent", 99))
         minimum_remaining = float(trigger.get("minimumRemainingPercent", 1))
         pacing_headroom = float(trigger.get("pacingHeadroomPercent", 5))
+        bootstrap_allowance = float(trigger.get("bootstrapAllowancePercent", 3))
         final_drain_minutes = float(trigger.get("finalWeeklyDrainMinutes", 180))
         minimum_weekly_duration = int(trigger.get("weeklyWindowMinimumMinutes", 8640))
         max_minutes = float(trigger.get("maxCycleMinutes", 25))
@@ -713,6 +720,7 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
             target_used=target_used,
             minimum_remaining=minimum_remaining,
             pacing_headroom=pacing_headroom,
+            bootstrap_allowance=bootstrap_allowance,
             final_drain_minutes=final_drain_minutes,
             minimum_weekly_duration=minimum_weekly_duration,
         )
@@ -763,6 +771,7 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
                 target_used=target_used,
                 minimum_remaining=minimum_remaining,
                 pacing_headroom=pacing_headroom,
+                bootstrap_allowance=bootstrap_allowance,
                 final_drain_minutes=final_drain_minutes,
                 minimum_weekly_duration=minimum_weekly_duration,
             )

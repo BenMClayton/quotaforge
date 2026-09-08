@@ -40,6 +40,7 @@ class WindowTests(unittest.TestCase):
             target_used=99,
             minimum_remaining=1,
             pacing_headroom=5,
+            bootstrap_allowance=3,
             final_drain_minutes=180,
             minimum_weekly_duration=8640,
             now=now,
@@ -64,6 +65,28 @@ class WindowTests(unittest.TestCase):
         ]
         plan = self.plan(windows, now)
         self.assertFalse(plan.budget_available)
+        self.assertFalse(plan.eligible)
+
+    def test_bootstrap_allows_first_expiring_window_to_anchor_week(self):
+        now = 2_000_000_000
+        windows = [
+            quotaforge.Window("codex:secondary", 0, int(now + 10080 * 60), 10080),
+            quotaforge.Window("codex:primary", 0, int(now + 10 * 60), 300),
+        ]
+        plan = self.plan(windows, now)
+        self.assertEqual(plan.weekly_progress_percent, 0)
+        self.assertEqual(plan.weekly_cap_percent, 3)
+        self.assertTrue(plan.budget_available)
+        self.assertTrue(plan.eligible)
+
+    def test_bootstrap_still_waits_until_short_window_is_expiring(self):
+        now = 2_000_000_000
+        windows = [
+            quotaforge.Window("codex:secondary", 0, int(now + 10080 * 60), 10080),
+            quotaforge.Window("codex:primary", 0, int(now + 60 * 60), 300),
+        ]
+        plan = self.plan(windows, now)
+        self.assertTrue(plan.budget_available)
         self.assertFalse(plan.eligible)
 
     def test_final_weekly_drain_does_not_require_short_reset(self):

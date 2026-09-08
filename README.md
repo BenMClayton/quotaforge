@@ -61,6 +61,8 @@ committed accidentally. See [config.example.json](config.example.json).
 - `targetUsedPercent`: stop once the expiring bucket reaches this value.
 - `pacingHeadroomPercent`: stay this far behind linear weekly consumption to
   preserve room for interactive use (5% by default).
+- `bootstrapAllowancePercent`: permit up to this small weekly share near the
+  first expiring short window, preventing a zero-usage rolling-window deadlock.
 - `finalWeeklyDrainMinutes`: during the final three hours, permit catch-up to
   the final target even when no short window is near reset.
 - `weeklyWindowMinimumMinutes`: fail closed unless a genuine long-duration
