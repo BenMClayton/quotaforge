@@ -122,22 +122,30 @@ def enabled_repos(config: dict[str, Any]) -> list[RepoSpec]:
     return results
 
 
+def bundled_codex_path(local_app_data: pathlib.Path | None = None) -> str | None:
+    root = local_app_data or pathlib.Path(os.environ.get("LOCALAPPDATA", ""))
+    native_root = root / "OpenAI" / "Codex" / "bin"
+    native_candidates = sorted(
+        native_root.glob("*/codex.exe"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return str(native_candidates[0]) if native_candidates else None
+
+
 def command_path(name: str) -> str:
+    # Scheduled Tasks inherit a different PATH from the desktop app. Prefer the
+    # app-bundled Codex so automation does not silently select an older npm CLI.
+    if os.name == "nt" and name == "codex":
+        bundled = bundled_codex_path()
+        if bundled:
+            return bundled
     candidates = [f"{name}.exe", f"{name}.cmd", name] if os.name == "nt" else [name]
     for candidate in candidates:
         found = shutil.which(candidate)
         if found:
             return found
     if os.name == "nt" and name == "codex":
-        local_app_data = pathlib.Path(os.environ.get("LOCALAPPDATA", ""))
-        native_root = local_app_data / "OpenAI" / "Codex" / "bin"
-        native_candidates = sorted(
-            native_root.glob("*/codex.exe"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        if native_candidates:
-            return str(native_candidates[0])
         app_data = pathlib.Path(os.environ.get("APPDATA", ""))
         npm_launcher = app_data / "npm" / "codex.cmd"
         if npm_launcher.is_file():
@@ -202,6 +210,15 @@ def codex_auth_mode() -> str:
             f"Current status: {combined}"
         )
     return combined
+
+
+def codex_runtime_info() -> tuple[str, str]:
+    executable = command_path("codex")
+    result = run([executable, "--version"], timeout=30)
+    version = (result.stdout or result.stderr).strip()
+    if not version:
+        raise QuotaForgeError("Codex returned no version information.")
+    return executable, version
 
 
 def app_server_request(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -558,8 +575,8 @@ def changed_paths(repo: pathlib.Path) -> list[str]:
     return paths
 
 
-def rollback_managed_changes(repo: pathlib.Path) -> None:
-    git(repo, "reset", "--hard", "HEAD")
+def rollback_managed_changes(repo: pathlib.Path, target: str = "HEAD") -> None:
+    git(repo, "reset", "--hard", target)
     git(repo, "clean", "-fd")
 
 
@@ -579,29 +596,26 @@ def improve_once(
     if dry_run:
         return {"repo": spec.slug, "dryRun": True, "branch": branch}
 
+    base_commit = git(repo, "rev-parse", "HEAD")
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     preflight_message = f"chore(quotaforge): preflight {run_id}"
     git(repo, "commit", "--allow-empty", "-m", preflight_message)
-    if config.get("behavior", {}).get("push", True):
-        git(repo, "push", "origin", f"HEAD:{branch}", timeout=300)
     logger.write("preflight_committed", repo=spec.slug, runId=run_id)
 
     try:
         result = run_codex_improvement(repo, config, run_id, minimum_idle, hard_deadline)
     except Exception:
-        if changed_paths(repo):
-            rollback_managed_changes(repo)
+        rollback_managed_changes(repo, base_commit)
         raise
 
     paths = changed_paths(repo)
     if result.get("noChange") or not paths:
-        if paths:
-            rollback_managed_changes(repo)
+        rollback_managed_changes(repo, base_commit)
         logger.write("no_change", repo=spec.slug, runId=run_id, summary=result.get("summary", ""))
         return {"repo": spec.slug, "runId": run_id, "noChange": True, **result}
     unsafe = [path for path in paths if SENSITIVE_NAMES.search(path)]
     if unsafe:
-        rollback_managed_changes(repo)
+        rollback_managed_changes(repo, base_commit)
         raise QuotaForgeError(f"Blocked suspicious sensitive paths: {', '.join(unsafe)}")
 
     git(repo, "add", "--all")
@@ -653,9 +667,11 @@ def acquire_lock(path: pathlib.Path):
 
 def status(config_path: pathlib.Path, config: dict[str, Any]) -> int:
     auth = codex_auth_mode()
+    codex_path, codex_version = codex_runtime_info()
     _, windows = read_windows()
     print(f"Config: {config_path}")
     print(f"Auth: {auth}")
+    print(f"Codex: {codex_version} ({codex_path})")
     print(f"Idle: {idle_minutes():.1f} minutes")
     print(f"Enabled repositories: {len(enabled_repos(config))}")
     for window in sorted(windows, key=lambda item: item.resets_at):
@@ -699,6 +715,8 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
             return 0
         auth = codex_auth_mode()
         logger.write("auth_checked", status=auth)
+        codex_path, codex_version = codex_runtime_info()
+        logger.write("runtime_checked", path=codex_path, version=codex_version)
 
         trigger = config.get("trigger", {})
         minutes_before = float(trigger.get("minutesBeforeReset", 30))

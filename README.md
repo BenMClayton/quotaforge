@@ -33,6 +33,8 @@ The installer creates `%USERPROFILE%\.quotaforge\config.json` and a hidden
 per-user Scheduled Task that checks every five minutes and again after logon.
 Codex, Git, and notification helpers are also launched with Windows' no-console
 flag so those background checks do not flash terminal windows.
+QuotaForge prefers the current CLI bundled with the Codex desktop app over an
+older npm installation that may appear first in a Scheduled Task's `PATH`.
 The task persists across restarts, but runs only after the user signs in. When the current clone
 has a GitHub `origin`, it is added as the first disabled allowlist example; edit
 the config and set `enabled` to `true` after reviewing it.

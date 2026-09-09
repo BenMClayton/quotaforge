@@ -4,6 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "src" / "quotaforge.py"
@@ -124,6 +125,74 @@ class BackgroundProcessTests(unittest.TestCase):
             else 0
         )
         self.assertEqual(quotaforge.hidden_process_flags(), expected)
+
+    def test_bundled_codex_selects_newest_desktop_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_root = pathlib.Path(temporary) / "OpenAI" / "Codex" / "bin"
+            older = runtime_root / "old" / "codex.exe"
+            newer = runtime_root / "new" / "codex.exe"
+            older.parent.mkdir(parents=True)
+            newer.parent.mkdir(parents=True)
+            older.touch()
+            time.sleep(0.01)
+            newer.touch()
+            self.assertEqual(
+                quotaforge.bundled_codex_path(pathlib.Path(temporary)), str(newer)
+            )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Codex resolver test")
+    def test_command_path_prefers_bundled_codex_over_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundled = (
+                pathlib.Path(temporary)
+                / "OpenAI"
+                / "Codex"
+                / "bin"
+                / "current"
+                / "codex.exe"
+            )
+            bundled.parent.mkdir(parents=True)
+            bundled.touch()
+            with mock.patch.dict(quotaforge.os.environ, {"LOCALAPPDATA": temporary}):
+                with mock.patch.object(quotaforge.shutil, "which", return_value="old-codex.cmd"):
+                    self.assertEqual(quotaforge.command_path("codex"), str(bundled))
+
+
+class FailedAttemptTests(unittest.TestCase):
+    def test_failed_codex_run_removes_local_preflight_and_changes(self):
+        repo = pathlib.Path("managed-repo")
+        spec = quotaforge.RepoSpec(
+            "https://github.com/Owner/repo.git", "Owner", "repo", None
+        )
+        logger = mock.Mock()
+
+        def fake_git(_repo, *args, **_kwargs):
+            if args == ("branch", "--show-current"):
+                return "master"
+            if args == ("rev-parse", "HEAD"):
+                return "base-sha"
+            return ""
+
+        with mock.patch.object(quotaforge, "managed_checkout", return_value=repo):
+            with mock.patch.object(quotaforge, "git", side_effect=fake_git) as git_mock:
+                with mock.patch.object(
+                    quotaforge,
+                    "run_codex_improvement",
+                    side_effect=quotaforge.QuotaForgeError("incompatible runtime"),
+                ):
+                    with self.assertRaises(quotaforge.QuotaForgeError):
+                        quotaforge.improve_once(
+                            pathlib.Path("data"),
+                            spec,
+                            {},
+                            logger,
+                            0,
+                            time.monotonic() + 10,
+                            False,
+                        )
+
+        git_mock.assert_any_call(repo, "reset", "--hard", "base-sha")
+        git_mock.assert_any_call(repo, "clean", "-fd")
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows file locking test")
