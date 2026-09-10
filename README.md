@@ -109,6 +109,19 @@ The Codex app-server surface used for local quota reads is documented, while
 the command itself is still marked experimental. QuotaForge fails closed if it
 cannot read usage.
 
+## Development
+
+The core scheduler and safety checks use only the Python standard library.
+
+```powershell
+python -m unittest discover -s tests -v
+python .\src\quotaforge.py --once --force --dry-run
+```
+
+The test suite covers URL allowlisting, quota-window selection, pacing,
+configuration validation, checkout safety, and command construction without
+making network changes.
+
 ## License
 
 MIT
