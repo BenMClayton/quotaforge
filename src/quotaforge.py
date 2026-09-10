@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 APP_NAME = "QuotaForge"
@@ -28,6 +28,10 @@ VERSION = "0.1.0"
 DEFAULT_DATA = pathlib.Path.home() / ".quotaforge"
 DEFAULT_CONFIG = DEFAULT_DATA / "config.json"
 GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SESSION_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 SENSITIVE_NAMES = re.compile(
     r"(^|/)(\.env($|\.)|credentials?($|\.)|secrets?($|\.)|auth\.json$|id_rsa$|id_ed25519$)|\.(pem|pfx|p12|key)$",
     re.IGNORECASE,
@@ -40,6 +44,13 @@ class QuotaForgeError(RuntimeError):
 
 class CycleAlreadyRunning(QuotaForgeError):
     pass
+
+
+class CyclePaused(QuotaForgeError):
+    def __init__(self, reason: str, session_id: str | None):
+        super().__init__(reason)
+        self.reason = reason
+        self.session_id = session_id
 
 
 @dataclass(frozen=True)
@@ -440,7 +451,53 @@ def git(repo: pathlib.Path, *args: str, check: bool = True, timeout: int = 120) 
     return run([command_path("git"), *args], cwd=repo, check=check, timeout=timeout).stdout.strip()
 
 
-def managed_checkout(data_dir: pathlib.Path, spec: RepoSpec, logger: JsonLogger) -> pathlib.Path:
+def continuation_file(data_dir: pathlib.Path, spec: RepoSpec) -> pathlib.Path:
+    return data_dir / "continuations" / spec.owner / f"{spec.repo}.json"
+
+
+def load_continuation(data_dir: pathlib.Path, spec: RepoSpec) -> dict[str, Any] | None:
+    path = continuation_file(data_dir, spec)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as exc:
+        raise QuotaForgeError(f"Invalid continuation state for {spec.slug}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("repo") != spec.slug:
+        raise QuotaForgeError(f"Invalid continuation state for {spec.slug}.")
+    required = ("runId", "targetBranch", "workBranch", "baseCommit", "preflightCommit")
+    if any(not isinstance(value.get(key), str) or not value[key] for key in required):
+        raise QuotaForgeError(f"Incomplete continuation state for {spec.slug}.")
+    if not value["workBranch"].startswith("quotaforge/wip/"):
+        raise QuotaForgeError(f"Unsafe continuation branch for {spec.slug}.")
+    session_id = value.get("sessionId")
+    if session_id is not None and (
+        not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id)
+    ):
+        raise QuotaForgeError(f"Invalid Codex session ID for {spec.slug}.")
+    if value.get("phase", "working") not in {"working", "ready_to_push"}:
+        raise QuotaForgeError(f"Invalid continuation phase for {spec.slug}.")
+    return value
+
+
+def save_continuation(data_dir: pathlib.Path, spec: RepoSpec, value: dict[str, Any]) -> None:
+    save_state(continuation_file(data_dir, spec), value)
+
+
+def clear_continuation(data_dir: pathlib.Path, spec: RepoSpec) -> None:
+    path = continuation_file(data_dir, spec)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def managed_checkout(
+    data_dir: pathlib.Path,
+    spec: RepoSpec,
+    logger: JsonLogger,
+    continuation: dict[str, Any] | None = None,
+) -> pathlib.Path:
     root = (data_dir / "repos").resolve()
     repo = (root / spec.owner / spec.repo).resolve()
     if root not in repo.parents:
@@ -455,6 +512,17 @@ def managed_checkout(data_dir: pathlib.Path, spec: RepoSpec, logger: JsonLogger)
     remote = normalize_github_url(git(repo, "remote", "get-url", "origin"))
     if remote.url.lower() != spec.url.lower():
         raise QuotaForgeError(f"Remote changed for {spec.slug}; expected {spec.url}, found {remote.url}")
+    if continuation:
+        current_branch = git(repo, "branch", "--show-current")
+        if current_branch != continuation["workBranch"]:
+            raise QuotaForgeError(
+                f"Continuation branch changed for {spec.slug}; expected "
+                f"{continuation['workBranch']}, found {current_branch or 'detached HEAD'}."
+            )
+        head = git(repo, "rev-parse", "HEAD")
+        if head != continuation["preflightCommit"] and continuation.get("phase") != "ready_to_push":
+            raise QuotaForgeError(f"Continuation history changed unexpectedly for {spec.slug}.")
+        return repo
     if git(repo, "status", "--porcelain"):
         raise QuotaForgeError(f"Managed checkout is dirty; refusing to proceed: {repo}")
     git(repo, "fetch", "--prune", "origin", timeout=300)
@@ -492,6 +560,79 @@ change merely to consume capacity; if no justified safe improvement exists, leav
 Return the required JSON with a short title, useful summary, tests run/results, and noChange."""
 
 
+def continuation_prompt(run_id: str) -> str:
+    return f"""Continue QuotaForge autonomous maintenance cycle {run_id} from where it paused.
+Inspect the existing working-tree changes, finish exactly the same small improvement, and run the
+most relevant checks. Do not commit, push, create branches, modify Git configuration, read files
+outside this repository, add secrets, or change credential/key files. If the original improvement
+is no longer safe or justified, revert only its working-tree changes and report noChange. Return
+the required JSON with a short title, useful summary, tests run/results, and noChange."""
+
+
+def session_id_from_events(path: pathlib.Path) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "thread.started":
+            session_id = event.get("thread_id") or event.get("threadId")
+            if isinstance(session_id, str) and SESSION_ID_RE.fullmatch(session_id):
+                return session_id
+    return None
+
+
+def codex_exec_args(
+    repo: pathlib.Path,
+    config: dict[str, Any],
+    run_id: str,
+    schema: pathlib.Path,
+    output: pathlib.Path,
+    session_id: str | None,
+) -> list[str]:
+    behavior = config.get("behavior", {})
+    common = [
+        "--json",
+        "--output-schema",
+        str(schema),
+        "--output-last-message",
+        str(output),
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        f'model_reasoning_effort="{behavior.get("reasoningEffort", "medium")}"',
+    ]
+    if session_id:
+        args = [
+            command_path("codex"),
+            "exec",
+            "resume",
+            *common,
+            "-c",
+            'sandbox_mode="workspace-write"',
+        ]
+        if behavior.get("model"):
+            args += ["--model", str(behavior["model"])]
+        return [*args, session_id, continuation_prompt(run_id)]
+
+    args = [
+        command_path("codex"),
+        "exec",
+        *common,
+        "--sandbox",
+        "workspace-write",
+        "-C",
+        str(repo),
+    ]
+    if behavior.get("model"):
+        args += ["--model", str(behavior["model"])]
+    return [*args, improvement_prompt(run_id)]
+
+
 def terminate_process(proc: subprocess.Popen[str]) -> None:
     proc.terminate()
     try:
@@ -506,62 +647,62 @@ def run_codex_improvement(
     run_id: str,
     minimum_idle: float,
     hard_deadline: float,
-) -> dict[str, Any]:
-    behavior = config.get("behavior", {})
+    session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
+) -> tuple[dict[str, Any], str | None]:
     with tempfile.TemporaryDirectory(prefix="quotaforge-") as temp:
         temp_path = pathlib.Path(temp)
         schema = temp_path / "result.schema.json"
         output = temp_path / "result.json"
+        events = temp_path / "events.jsonl"
+        diagnostics = temp_path / "stderr.log"
         write_schema(schema)
-        args = [
-            command_path("codex"),
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            "workspace-write",
-            "--output-schema",
-            str(schema),
-            "--output-last-message",
-            str(output),
-            "--color",
-            "never",
-            "-C",
-            str(repo),
-            "-c",
-            'approval_policy="never"',
-            "-c",
-            f'model_reasoning_effort="{behavior.get("reasoningEffort", "medium")}"',
-        ]
-        if behavior.get("model"):
-            args += ["--model", str(behavior["model"])]
-        args.append(improvement_prompt(run_id))
-        proc = subprocess.Popen(
-            args,
-            cwd=str(repo),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=hidden_process_flags(),
-        )
-        while proc.poll() is None:
-            if time.monotonic() >= hard_deadline:
-                terminate_process(proc)
-                raise QuotaForgeError("Cycle deadline reached; stopped Codex.")
-            if idle_minutes() < minimum_idle:
-                terminate_process(proc)
-                raise QuotaForgeError("User activity detected; stopped Codex to protect interactivity.")
-            time.sleep(2)
-        stdout, stderr = proc.communicate()
+        args = codex_exec_args(repo, config, run_id, schema, output, session_id)
+        paused_reason: str | None = None
+        discovered_session = session_id
+        with events.open("w", encoding="utf-8") as stdout_handle, diagnostics.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            proc = subprocess.Popen(
+                args,
+                cwd=str(repo),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                shell=False,
+                creationflags=hidden_process_flags(),
+            )
+            while proc.poll() is None:
+                if discovered_session is None:
+                    discovered_session = session_id_from_events(events)
+                    if discovered_session and on_session_started:
+                        on_session_started(discovered_session)
+                if time.monotonic() >= hard_deadline:
+                    paused_reason = "Cycle deadline reached."
+                    terminate_process(proc)
+                    break
+                if idle_minutes() < minimum_idle:
+                    paused_reason = "User activity detected."
+                    terminate_process(proc)
+                    break
+                time.sleep(2)
+
+        final_session = session_id_from_events(events) or discovered_session
+        if final_session != discovered_session and final_session and on_session_started:
+            on_session_started(final_session)
+        discovered_session = final_session
+        if paused_reason:
+            raise CyclePaused(paused_reason, discovered_session)
         if proc.returncode:
-            raise QuotaForgeError(f"Codex run failed ({proc.returncode}): {(stderr or stdout)[-2000:]}")
+            detail = diagnostics.read_text(encoding="utf-8", errors="replace")[-2000:]
+            raise QuotaForgeError(f"Codex run failed ({proc.returncode}): {detail}")
         try:
             result = json.loads(output.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise QuotaForgeError(f"Codex returned no valid structured result: {exc}") from exc
-        return result
+        return result, discovered_session
 
 
 def changed_paths(repo: pathlib.Path) -> list[str]:
@@ -580,6 +721,43 @@ def rollback_managed_changes(repo: pathlib.Path, target: str = "HEAD") -> None:
     git(repo, "clean", "-fd")
 
 
+def abandon_attempt(
+    repo: pathlib.Path,
+    data_dir: pathlib.Path,
+    spec: RepoSpec,
+    continuation: dict[str, Any],
+) -> None:
+    rollback_managed_changes(repo, continuation["baseCommit"])
+    git(repo, "switch", continuation["targetBranch"])
+    git(repo, "branch", "-D", continuation["workBranch"])
+    clear_continuation(data_dir, spec)
+
+
+def publish_attempt(
+    repo: pathlib.Path,
+    data_dir: pathlib.Path,
+    spec: RepoSpec,
+    config: dict[str, Any],
+    continuation: dict[str, Any],
+) -> dict[str, Any]:
+    result = continuation.get("result")
+    if not isinstance(result, dict) or not result.get("commit"):
+        raise QuotaForgeError(f"Completed continuation state is invalid for {spec.slug}.")
+    if config.get("behavior", {}).get("push", True):
+        git(
+            repo,
+            "push",
+            "origin",
+            f"HEAD:{continuation['targetBranch']}",
+            timeout=300,
+        )
+    git(repo, "switch", continuation["targetBranch"])
+    git(repo, "merge", "--ff-only", continuation["workBranch"])
+    git(repo, "branch", "-D", continuation["workBranch"])
+    clear_continuation(data_dir, spec)
+    return result
+
+
 def improve_once(
     data_dir: pathlib.Path,
     spec: RepoSpec,
@@ -589,51 +767,133 @@ def improve_once(
     hard_deadline: float,
     dry_run: bool,
 ) -> dict[str, Any]:
-    repo = managed_checkout(data_dir, spec, logger)
-    branch = git(repo, "branch", "--show-current")
-    if not branch:
-        raise QuotaForgeError(f"Detached HEAD is not supported for {spec.slug}.")
+    continuation = load_continuation(data_dir, spec)
+    repo = managed_checkout(data_dir, spec, logger, continuation)
     if dry_run:
-        return {"repo": spec.slug, "dryRun": True, "branch": branch}
+        return {
+            "repo": spec.slug,
+            "dryRun": True,
+            "branch": continuation["targetBranch"] if continuation else git(repo, "branch", "--show-current"),
+            "wouldResume": bool(continuation),
+        }
 
-    base_commit = git(repo, "rev-parse", "HEAD")
-    run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    preflight_message = f"chore(quotaforge): preflight {run_id}"
-    git(repo, "commit", "--allow-empty", "-m", preflight_message)
-    logger.write("preflight_committed", repo=spec.slug, runId=run_id)
+    if continuation:
+        if spec.branch and continuation["targetBranch"] != spec.branch:
+            raise QuotaForgeError(
+                f"Configured branch changed while {spec.slug} has paused work."
+            )
+        if continuation.get("phase") == "ready_to_push":
+            result = publish_attempt(repo, data_dir, spec, config, continuation)
+            logger.write(
+                "continuation_published",
+                repo=spec.slug,
+                runId=continuation["runId"],
+                commit=result["commit"],
+            )
+            return result
+        logger.write(
+            "continuation_resumed",
+            repo=spec.slug,
+            runId=continuation["runId"],
+            sessionId=continuation.get("sessionId"),
+        )
+    else:
+        target_branch = git(repo, "branch", "--show-current")
+        if not target_branch:
+            raise QuotaForgeError(f"Detached HEAD is not supported for {spec.slug}.")
+        base_commit = git(repo, "rev-parse", "HEAD")
+        run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        work_branch = f"quotaforge/wip/{spec.owner}-{spec.repo}-{run_id}"
+        git(repo, "switch", "-c", work_branch)
+        git(repo, "commit", "--allow-empty", "-m", f"chore(quotaforge): preflight {run_id}")
+        preflight_commit = git(repo, "rev-parse", "HEAD")
+        continuation = {
+            "version": 1,
+            "phase": "working",
+            "repo": spec.slug,
+            "runId": run_id,
+            "targetBranch": target_branch,
+            "workBranch": work_branch,
+            "baseCommit": base_commit,
+            "preflightCommit": preflight_commit,
+            "sessionId": None,
+            "startedAt": utc_now(),
+        }
+        save_continuation(data_dir, spec, continuation)
+        logger.write(
+            "preflight_committed",
+            repo=spec.slug,
+            runId=run_id,
+            workBranch=work_branch,
+        )
 
     try:
-        result = run_codex_improvement(repo, config, run_id, minimum_idle, hard_deadline)
+        def remember_session(session_id: str) -> None:
+            if continuation.get("sessionId") != session_id:
+                continuation["sessionId"] = session_id
+                save_continuation(data_dir, spec, continuation)
+
+        result, session_id = run_codex_improvement(
+            repo,
+            config,
+            continuation["runId"],
+            minimum_idle,
+            hard_deadline,
+            continuation.get("sessionId"),
+            remember_session,
+        )
+    except CyclePaused as exc:
+        continuation["sessionId"] = exc.session_id or continuation.get("sessionId")
+        continuation["pausedAt"] = utc_now()
+        continuation["pauseReason"] = exc.reason
+        save_continuation(data_dir, spec, continuation)
+        raise
     except Exception:
-        rollback_managed_changes(repo, base_commit)
+        abandon_attempt(repo, data_dir, spec, continuation)
         raise
 
     paths = changed_paths(repo)
     if result.get("noChange") or not paths:
-        rollback_managed_changes(repo, base_commit)
-        logger.write("no_change", repo=spec.slug, runId=run_id, summary=result.get("summary", ""))
-        return {"repo": spec.slug, "runId": run_id, "noChange": True, **result}
+        abandon_attempt(repo, data_dir, spec, continuation)
+        logger.write(
+            "no_change",
+            repo=spec.slug,
+            runId=continuation["runId"],
+            summary=result.get("summary", ""),
+        )
+        return {"repo": spec.slug, "runId": continuation["runId"], "noChange": True, **result}
     unsafe = [path for path in paths if SENSITIVE_NAMES.search(path)]
     if unsafe:
-        rollback_managed_changes(repo, base_commit)
+        abandon_attempt(repo, data_dir, spec, continuation)
         raise QuotaForgeError(f"Blocked suspicious sensitive paths: {', '.join(unsafe)}")
 
     git(repo, "add", "--all")
     title = str(result.get("title") or "autonomous improvement").strip().splitlines()[0][:72]
     git(repo, "commit", "-m", f"fix(quotaforge): {title}")
     commit = git(repo, "rev-parse", "--short", "HEAD")
-    if config.get("behavior", {}).get("push", True):
-        git(repo, "push", "origin", f"HEAD:{branch}", timeout=300)
+    completed = {
+        "repo": spec.slug,
+        "runId": continuation["runId"],
+        "commit": commit,
+        "paths": paths,
+        **result,
+    }
+    continuation["phase"] = "ready_to_push"
+    continuation["sessionId"] = session_id or continuation.get("sessionId")
+    continuation["completedAt"] = utc_now()
+    continuation["result"] = completed
+    save_continuation(data_dir, spec, continuation)
+    published = publish_attempt(repo, data_dir, spec, config, continuation)
     logger.write(
         "improvement_committed",
         repo=spec.slug,
-        runId=run_id,
+        runId=continuation["runId"],
         commit=commit,
         title=title,
         paths=paths,
         tests=result.get("tests", ""),
     )
-    return {"repo": spec.slug, "runId": run_id, "commit": commit, "paths": paths, **result}
+    return published
 
 
 def load_state(path: pathlib.Path) -> dict[str, Any]:
@@ -673,7 +933,21 @@ def status(config_path: pathlib.Path, config: dict[str, Any]) -> int:
     print(f"Auth: {auth}")
     print(f"Codex: {codex_version} ({codex_path})")
     print(f"Idle: {idle_minutes():.1f} minutes")
-    print(f"Enabled repositories: {len(enabled_repos(config))}")
+    repos = enabled_repos(config)
+    print(f"Enabled repositories: {len(repos)}")
+    pending: list[tuple[RepoSpec, dict[str, Any]]] = []
+    for spec in repos:
+        continuation = load_continuation(config_path.parent, spec)
+        if continuation:
+            pending.append((spec, continuation))
+    if pending:
+        for spec, continuation in pending:
+            print(
+                f"Pending continuation: {spec.slug}, phase={continuation.get('phase', 'working')}, "
+                f"paused={continuation.get('pauseReason', 'not recorded')}"
+            )
+    else:
+        print("Pending continuations: none")
     for window in sorted(windows, key=lambda item: item.resets_at):
         reset = dt.datetime.fromtimestamp(window.resets_at, dt.timezone.utc).astimezone()
         print(
@@ -773,7 +1047,15 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
         )
         state_path = data_dir / "state.json"
         state = load_state(state_path)
-        start_index = int(state.get("nextRepoIndex", 0)) % len(repos)
+        pending_index = next(
+            (index for index, repo_spec in enumerate(repos) if continuation_file(data_dir, repo_spec).is_file()),
+            None,
+        )
+        start_index = (
+            pending_index
+            if pending_index is not None
+            else int(state.get("nextRepoIndex", 0)) % len(repos)
+        )
         completed: list[dict[str, Any]] = []
 
         for turn in range(max_turns):
@@ -806,7 +1088,8 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
             if not force and not current_plan.eligible:
                 logger.write("stopped", reason=current_plan.reason)
                 break
-            spec = repos[(start_index + turn) % len(repos)]
+            selected_index = (start_index + turn) % len(repos)
+            spec = repos[selected_index]
             try:
                 effective_minimum_idle = 0 if force else minimum_idle
                 result = improve_once(
@@ -819,10 +1102,27 @@ def cycle(config_path: pathlib.Path, force: bool, dry_run: bool) -> int:
                     dry_run,
                 )
                 completed.append(result)
+            except CyclePaused as exc:
+                logger.write(
+                    "continuation_paused",
+                    repo=spec.slug,
+                    reason=exc.reason,
+                    sessionId=exc.session_id,
+                )
+                state["nextRepoIndex"] = selected_index
+                state["lastRunAt"] = utc_now()
+                save_state(state_path, state)
+                break
             except QuotaForgeError as exc:
                 logger.write("repo_failed", repo=spec.slug, error=str(exc))
                 notify(config, "QuotaForge needs attention", f"{spec.slug}: {exc}", logger)
-            state["nextRepoIndex"] = (start_index + turn + 1) % len(repos)
+                state["nextRepoIndex"] = (
+                    selected_index
+                    if continuation_file(data_dir, spec).is_file()
+                    else (selected_index + 1) % len(repos)
+                )
+            else:
+                state["nextRepoIndex"] = (selected_index + 1) % len(repos)
             state["lastRunAt"] = utc_now()
             save_state(state_path, state)
             if dry_run:

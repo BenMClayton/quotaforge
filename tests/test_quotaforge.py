@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
@@ -158,6 +159,222 @@ class BackgroundProcessTests(unittest.TestCase):
                     self.assertEqual(quotaforge.command_path("codex"), str(bundled))
 
 
+class ContinuationTests(unittest.TestCase):
+    @staticmethod
+    def git(repo, *args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_extracts_session_id_from_json_events(self):
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        with tempfile.TemporaryDirectory() as temporary:
+            events = pathlib.Path(temporary) / "events.jsonl"
+            events.write_text(
+                '{"type":"turn.started"}\n'
+                f'{{"type":"thread.started","thread_id":"{session_id}"}}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(quotaforge.session_id_from_events(events), session_id)
+
+    def test_initial_exec_is_persistent_and_resume_targets_saved_session(self):
+        repo = pathlib.Path("repo")
+        schema = pathlib.Path("schema.json")
+        output = pathlib.Path("output.json")
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        with mock.patch.object(quotaforge, "command_path", return_value="codex.exe"):
+            initial = quotaforge.codex_exec_args(repo, {}, "run-1", schema, output, None)
+            resumed = quotaforge.codex_exec_args(
+                repo, {}, "run-1", schema, output, session_id
+            )
+        self.assertNotIn("--ephemeral", initial)
+        self.assertEqual(initial[:2], ["codex.exe", "exec"])
+        self.assertEqual(resumed[:3], ["codex.exe", "exec", "resume"])
+        self.assertIn(session_id, resumed)
+
+    def test_paused_run_preserves_work_branch_and_session(self):
+        repo = pathlib.Path("managed-repo")
+        spec = quotaforge.RepoSpec(
+            "https://github.com/Owner/repo.git", "Owner", "repo", None
+        )
+        logger = mock.Mock()
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        revisions = iter(["base-sha", "preflight-sha"])
+
+        def fake_git(_repo, *args, **_kwargs):
+            if args == ("branch", "--show-current"):
+                return "master"
+            if args == ("rev-parse", "HEAD"):
+                return next(revisions)
+            return ""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = pathlib.Path(temporary)
+            with mock.patch.object(quotaforge, "managed_checkout", return_value=repo):
+                with mock.patch.object(quotaforge, "git", side_effect=fake_git) as git_mock:
+                    with mock.patch.object(
+                        quotaforge,
+                        "run_codex_improvement",
+                        side_effect=quotaforge.CyclePaused("Cycle deadline reached.", session_id),
+                    ):
+                        with self.assertRaises(quotaforge.CyclePaused):
+                            quotaforge.improve_once(
+                                data_dir,
+                                spec,
+                                {},
+                                logger,
+                                0,
+                                time.monotonic() + 10,
+                                False,
+                            )
+            continuation = quotaforge.load_continuation(data_dir, spec)
+
+        self.assertIsNotNone(continuation)
+        self.assertEqual(continuation["sessionId"], session_id)
+        self.assertTrue(continuation["workBranch"].startswith("quotaforge/wip/"))
+        self.assertNotIn(mock.call(repo, "reset", "--hard", "base-sha"), git_mock.mock_calls)
+
+    def test_next_attempt_resumes_saved_run_and_session(self):
+        repo = pathlib.Path("managed-repo")
+        spec = quotaforge.RepoSpec(
+            "https://github.com/Owner/repo.git", "Owner", "repo", None
+        )
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        continuation = {
+            "version": 1,
+            "phase": "working",
+            "repo": spec.slug,
+            "runId": "run-1",
+            "targetBranch": "master",
+            "workBranch": "quotaforge/wip/Owner-repo-run-1",
+            "baseCommit": "base-sha",
+            "preflightCommit": "preflight-sha",
+            "sessionId": session_id,
+            "startedAt": "2026-09-10T07:00:00+00:00",
+        }
+        logger = mock.Mock()
+        deadline = time.monotonic() + 10
+
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = pathlib.Path(temporary)
+            quotaforge.save_continuation(data_dir, spec, continuation)
+            with mock.patch.object(
+                quotaforge, "managed_checkout", return_value=repo
+            ) as checkout_mock:
+                with mock.patch.object(quotaforge, "git") as git_mock:
+                    with mock.patch.object(
+                        quotaforge,
+                        "run_codex_improvement",
+                        side_effect=quotaforge.CyclePaused(
+                            "Cycle deadline reached.", session_id
+                        ),
+                    ) as run_mock:
+                        with self.assertRaises(quotaforge.CyclePaused):
+                            quotaforge.improve_once(
+                                data_dir, spec, {}, logger, 20, deadline, False
+                            )
+
+            saved = quotaforge.load_continuation(data_dir, spec)
+
+        checkout_mock.assert_called_once()
+        self.assertEqual(checkout_mock.call_args.args[:3], (data_dir, spec, logger))
+        self.assertEqual(checkout_mock.call_args.args[3]["runId"], "run-1")
+        self.assertEqual(checkout_mock.call_args.args[3]["sessionId"], session_id)
+        run_mock.assert_called_once()
+        self.assertEqual(
+            run_mock.call_args.args[:6],
+            (repo, {}, "run-1", 20, deadline, session_id),
+        )
+        self.assertTrue(callable(run_mock.call_args.args[6]))
+        git_mock.assert_not_called()
+        self.assertEqual(saved["runId"], "run-1")
+        self.assertEqual(saved["sessionId"], session_id)
+
+    def test_real_git_work_survives_pause_then_publishes_on_resume(self):
+        spec = quotaforge.RepoSpec(
+            "https://github.com/Owner/repo.git", "Owner", "repo", None
+        )
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        logger = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            data_dir = root / "data"
+            repo = data_dir / "repos" / "Owner" / "repo"
+            remote = root / "remote.git"
+            repo.mkdir(parents=True)
+            self.git(root, "init", "--bare", "--initial-branch=master", str(remote))
+            self.git(repo, "init", "--initial-branch=master")
+            self.git(repo, "config", "user.name", "QuotaForge Tests")
+            self.git(repo, "config", "user.email", "quotaforge-tests@example.invalid")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self.git(repo, "add", "README.md")
+            self.git(repo, "commit", "-m", "base")
+            self.git(repo, "remote", "add", "origin", str(remote))
+            self.git(repo, "push", "-u", "origin", "master")
+
+            def pause_with_work(*args):
+                (repo / "improvement.txt").write_text("preserved\n", encoding="utf-8")
+                args[6](session_id)
+                raise quotaforge.CyclePaused("Cycle deadline reached.", session_id)
+
+            with mock.patch.object(quotaforge, "normalize_github_url", return_value=spec):
+                with mock.patch.object(
+                    quotaforge, "run_codex_improvement", side_effect=pause_with_work
+                ):
+                    with self.assertRaises(quotaforge.CyclePaused):
+                        quotaforge.improve_once(
+                            data_dir,
+                            spec,
+                            {"behavior": {"push": True}},
+                            logger,
+                            0,
+                            time.monotonic() + 10,
+                            False,
+                        )
+
+            continuation = quotaforge.load_continuation(data_dir, spec)
+            self.assertIsNotNone(continuation)
+            self.assertEqual(self.git(repo, "branch", "--show-current"), continuation["workBranch"])
+            self.assertEqual((repo / "improvement.txt").read_text(encoding="utf-8"), "preserved\n")
+
+            result = {
+                "title": "preserve paused work",
+                "summary": "Verified resumable work.",
+                "tests": "temporary Git lifecycle",
+                "noChange": False,
+            }
+            with mock.patch.object(quotaforge, "normalize_github_url", return_value=spec):
+                with mock.patch.object(
+                    quotaforge,
+                    "run_codex_improvement",
+                    return_value=(result, session_id),
+                ):
+                    published = quotaforge.improve_once(
+                        data_dir,
+                        spec,
+                        {"behavior": {"push": True}},
+                        logger,
+                        0,
+                        time.monotonic() + 10,
+                        False,
+                    )
+
+            self.assertEqual(self.git(repo, "branch", "--show-current"), "master")
+            self.assertEqual(self.git(repo, "rev-list", "--count", "HEAD"), "3")
+            self.assertEqual(
+                self.git(repo, "rev-parse", "HEAD"),
+                self.git(remote, "rev-parse", "refs/heads/master"),
+            )
+            self.assertEqual((repo / "improvement.txt").read_text(encoding="utf-8"), "preserved\n")
+            self.assertIsNone(quotaforge.load_continuation(data_dir, spec))
+            self.assertEqual(published["title"], "preserve paused work")
+
+
 class FailedAttemptTests(unittest.TestCase):
     def test_failed_codex_run_removes_local_preflight_and_changes(self):
         repo = pathlib.Path("managed-repo")
@@ -166,30 +383,35 @@ class FailedAttemptTests(unittest.TestCase):
         )
         logger = mock.Mock()
 
+        revisions = iter(["base-sha", "preflight-sha"])
+
         def fake_git(_repo, *args, **_kwargs):
             if args == ("branch", "--show-current"):
                 return "master"
             if args == ("rev-parse", "HEAD"):
-                return "base-sha"
+                return next(revisions)
             return ""
 
-        with mock.patch.object(quotaforge, "managed_checkout", return_value=repo):
-            with mock.patch.object(quotaforge, "git", side_effect=fake_git) as git_mock:
-                with mock.patch.object(
-                    quotaforge,
-                    "run_codex_improvement",
-                    side_effect=quotaforge.QuotaForgeError("incompatible runtime"),
-                ):
-                    with self.assertRaises(quotaforge.QuotaForgeError):
-                        quotaforge.improve_once(
-                            pathlib.Path("data"),
-                            spec,
-                            {},
-                            logger,
-                            0,
-                            time.monotonic() + 10,
-                            False,
-                        )
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = pathlib.Path(temporary)
+            with mock.patch.object(quotaforge, "managed_checkout", return_value=repo):
+                with mock.patch.object(quotaforge, "git", side_effect=fake_git) as git_mock:
+                    with mock.patch.object(
+                        quotaforge,
+                        "run_codex_improvement",
+                        side_effect=quotaforge.QuotaForgeError("incompatible runtime"),
+                    ):
+                        with self.assertRaises(quotaforge.QuotaForgeError):
+                            quotaforge.improve_once(
+                                data_dir,
+                                spec,
+                                {},
+                                logger,
+                                0,
+                                time.monotonic() + 10,
+                                False,
+                            )
+            self.assertIsNone(quotaforge.load_continuation(data_dir, spec))
 
         git_mock.assert_any_call(repo, "reset", "--hard", "base-sha")
         git_mock.assert_any_call(repo, "clean", "-fd")
